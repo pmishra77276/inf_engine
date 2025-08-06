@@ -146,12 +146,11 @@ def compute(model_instance, x, layers_per_chunk, cos, sin, k, max_new_tokens, at
                 m_next2 = Module(model_instance.model.layers, i, i + l_second).to('cuda', non_blocking=True)
             i += l_second
             rem -= l_second
-
     while True:
-        # Wait for transfer to complete before starting computation
+    # Wait for previous transfer to complete before compute
         stream_compute.wait_stream(stream_transfer)
-        
-        # Move pointers
+
+        # Move pointers forward
         m_previous = m_current
         m_current = m_next
         m_next = m_next2
@@ -160,39 +159,42 @@ def compute(model_instance, x, layers_per_chunk, cos, sin, k, max_new_tokens, at
         # Compute on current chunk
         with torch.cuda.stream(stream_compute):
             with torch.no_grad():
-                x = m_current(x.to('cuda', non_blocking=True),
-                              cos.to('cuda', non_blocking=True),
-                              sin.to('cuda', non_blocking=True),
-                              attention_mask.to('cuda', non_blocking=True))
+                x = m_current(
+                    x.to('cuda', non_blocking=True),
+                    cos.to('cuda', non_blocking=True),
+                    sin.to('cuda', non_blocking=True),
+                    attention_mask.to('cuda', non_blocking=True)
+                )
 
-        # Offload previous chunk to CPU (if exists)
+        # Offload the previous chunk after compute is done
         if m_previous is not None:
-            stream_offload.wait_stream(stream_compute)  # Wait for computation to finish before offloading
+            stream_offload.wait_stream(stream_compute)
             with torch.cuda.stream(stream_offload):
                 m_previous = m_previous.to('cpu', non_blocking=True)
                 del m_previous
             torch.cuda.empty_cache()
 
-        # If this is the last chunk, break
-        if rem == 0:
+        # If no more chunks left to load after this, finish
+        if rem == 0 and m_next is None and m_next2 is None:
+            # Wait for compute to complete
             stream_compute.synchronize()
-            # Offload the final chunk
+
+            # Offload the current module
             with torch.cuda.stream(stream_offload):
                 m_current = m_current.to('cpu', non_blocking=True)
+                del m_current
             stream_offload.synchronize()
             torch.cuda.empty_cache()
             break
 
-        # Load next chunk (2 steps ahead)
+        # Start preloading next-next chunk if any
         if rem > 0:
-            time.sleep(0.01) 
             l_next2 = min(layers_per_chunk, rem)
+            stream_transfer2.wait_stream(stream_transfer)
             with torch.cuda.stream(stream_transfer2):
                 m_next2 = Module(model_instance.model.layers, i, i + l_next2).to('cuda', non_blocking=True)
-            time.sleep(0.01)
             i += l_next2
             rem -= l_next2
-
     return x
 
 def model_inference(question,tokens=250):
